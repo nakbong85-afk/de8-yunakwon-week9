@@ -110,7 +110,7 @@ with DAG(
             state = hook.poll_query_status(query_id, max_polling_attempts=60, sleep_time=2)
             if state != "SUCCEEDED":
                 raise RuntimeError(f"Athena DDL 실패: state={state}, query_execution_id={query_id}")
-        return f"{ATHENA_DATABASE}.{ATHENA_TABLE} -> {GOLD_LOCATION}"
+        # 반환값을 두지 않는다. XCom 에는 query_top1 의 쿼리 실행 ID 만 남긴다
 
     # AthenaOperator 는 쿼리가 끝나면 QueryExecutionId 를 반환한다 -> XCom return_value
     query_top1 = AthenaOperator(
