@@ -1,0 +1,220 @@
+# 9주차 과제 — EC2(t3.large, 8GiB) 한 대에서 전부 실행
+#   Kafka 3 broker(KRaft) + kafka-ui + Spark standalone(master 1, worker 1) + Airflow
+#
+# 실행:  cd part1-ev && docker compose up -d --build
+#
+# AWS 자격 증명은 어디에도 넣지 않는다. 컨테이너 안의 Spark·Airflow 는
+# EC2 에 연결된 IAM Role(de9-ec2-nwyu)을 인스턴스 메타데이터로 받아 S3·Athena 에 접근한다.
+# (그래서 EC2 메타데이터 응답 홉 제한이 2 여야 한다)
+#
+# 8GiB 안에 들어가도록 JVM 힙을 제한했다:
+#   Kafka broker 384m x 3, kafka-ui 256m, Spark master/worker 데몬 256m,
+#   Spark worker 가 내줄 수 있는 메모리 1500m(익스큐터 1g), 드라이버 600m
+name: de9
+
+x-kafka: &kafka
+  image: apache/kafka:3.7.0
+  restart: unless-stopped
+
+x-kafka-env: &kafka-env
+  CLUSTER_ID: "ZGU5LW53eXUta2Fma2EtMQ"
+  KAFKA_PROCESS_ROLES: broker,controller
+  KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+  KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+  KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+  KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+  KAFKA_LOG_DIRS: /var/lib/kafka/data
+  KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+  KAFKA_NUM_PARTITIONS: 3
+  KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+  KAFKA_MIN_INSYNC_REPLICAS: 1
+  KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+  KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+  # 컨슈머 2개가 거의 동시에 들어올 때 첫 할당부터 파티션을 나눠 갖도록 3초 기다린다
+  KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
+  KAFKA_HEAP_OPTS: "-Xms384m -Xmx384m"
+
+services:
+  # ---------------------------------------------------------------- Kafka
+  # INTERNAL(9092): 컨테이너끼리 (Spark, kafka-ui)
+  # EXTERNAL(19092/29092/39092): EC2 호스트에서 돌리는 파이썬 Producer/Consumer. 127.0.0.1 에만 연다
+  kafka1:
+    <<: *kafka
+    container_name: kafka1
+    hostname: kafka1
+    ports:
+      - "127.0.0.1:19092:19092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:9092,EXTERNAL://localhost:19092
+    volumes:
+      - kafka1-data:/var/lib/kafka/data
+
+  kafka2:
+    <<: *kafka
+    container_name: kafka2
+    hostname: kafka2
+    ports:
+      - "127.0.0.1:29092:29092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka2:9092,EXTERNAL://localhost:29092
+    volumes:
+      - kafka2-data:/var/lib/kafka/data
+
+  kafka3:
+    <<: *kafka
+    container_name: kafka3
+    hostname: kafka3
+    ports:
+      - "127.0.0.1:39092:39092"
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:39092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka3:9092,EXTERNAL://localhost:39092
+    volumes:
+      - kafka3-data:/var/lib/kafka/data
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on: [kafka1, kafka2, kafka3]
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: de9-nwyu-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:9092,kafka2:9092,kafka3:9092
+      JAVA_OPTS: "-Xms128m -Xmx256m"
+
+  # ---------------------------------------------------------------- Spark standalone
+  # spark-submit 은 spark-master 컨테이너에서 한다(client 모드, 드라이버 = spark-master).
+  #   docker exec -it spark-master /opt/spark/bin/spark-submit /opt/de9/part1-ev/charger_stream.py
+  # master 주소·패키지·메모리·S3 설정은 아래 configs 의 spark-defaults.conf 에 모아 두었다.
+  spark-master:
+    image: apache/spark:3.5.3-java17-python3
+    container_name: spark-master
+    hostname: spark-master
+    user: root
+    restart: unless-stopped
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+    ports:
+      - "8081:8080"   # Spark master UI
+      - "4040:4040"   # 실행 중인 애플리케이션 UI
+    environment:
+      SPARK_DAEMON_MEMORY: 256m
+      SPARK_NO_DAEMONIZE: "true"
+      PYSPARK_PYTHON: python3
+      AWS_REGION: ap-northeast-2
+      AWS_DEFAULT_REGION: ap-northeast-2
+      DE9_BUCKET: de9-nwyu-lake
+      # Q5 Slack Incoming Webhook. 값은 EC2 의 part1-ev/.env 에만 둔다(.gitignore 대상)
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    configs:
+      - source: spark-defaults
+        target: /opt/spark/conf/spark-defaults.conf
+    volumes:
+      - ..:/opt/de9:ro
+      - spark-ivy:/opt/ivy
+      - spark-checkpoints:/opt/checkpoints
+
+  spark-worker:
+    image: apache/spark:3.5.3-java17-python3
+    container_name: spark-worker
+    hostname: spark-worker
+    user: root
+    restart: unless-stopped
+    depends_on: [spark-master]
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --cores
+      - "2"
+      - --memory
+      - 1500m
+      - --webui-port
+      - "8081"
+    ports:
+      - "8082:8081"   # Spark worker UI
+    environment:
+      SPARK_DAEMON_MEMORY: 256m
+      SPARK_NO_DAEMONIZE: "true"
+      PYSPARK_PYTHON: python3
+      AWS_REGION: ap-northeast-2
+      AWS_DEFAULT_REGION: ap-northeast-2
+    volumes:
+      - spark-checkpoints:/opt/checkpoints   # 스트리밍 상태 저장소(드라이버와 같은 경로를 공유)
+
+  # ---------------------------------------------------------------- Airflow (Q9)
+  # 이미지: part2-price/airflow/Dockerfile (Airflow 2.10.5 + JDK 17 + pyspark 3.5.3 + Kafka/S3 jar)
+  # SQLite + SequentialExecutor 로 메모리를 아낀다. DAG 하나를 순서대로 돌리는 데는 충분하다.
+  airflow:
+    build:
+      context: ../part2-price/airflow
+    image: de9-airflow:2.10.5
+    container_name: airflow
+    hostname: airflow
+    restart: unless-stopped
+    depends_on: [spark-master]
+    ports:
+      - "8090:8080"   # Airflow UI
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/db/airflow.db
+      AIRFLOW__WEBSERVER__WORKERS: "1"
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+      # SparkSubmitOperator 가 쓰는 연결. host 에 spark:// 까지 넣어야 master 주소가 된다
+      AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077}'
+      AWS_DEFAULT_REGION: ap-northeast-2
+      DE9_BUCKET: de9-nwyu-lake
+    command:
+      - bash
+      - -c
+      - |
+        airflow db migrate
+        airflow users create --username admin --password admin --firstname de9 --lastname nwyu --role Admin --email admin@example.com || true
+        airflow scheduler &
+        exec airflow webserver
+    volumes:
+      - ../part2-price/dags:/opt/airflow/dags:ro
+      - ..:/opt/de9:ro
+      - airflow-db:/opt/airflow/db
+
+configs:
+  spark-defaults:
+    content: |
+      spark.master                      spark://spark-master:7077
+      spark.jars.packages               org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.3,org.apache.hadoop:hadoop-aws:3.3.4
+      spark.jars.ivy                    /opt/ivy
+      spark.driver.memory               600m
+      spark.executor.memory             1g
+      spark.cores.max                   2
+      spark.sql.shuffle.partitions      2
+      spark.ui.showConsoleProgress      false
+      spark.hadoop.fs.s3a.aws.credentials.provider   org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider
+      spark.hadoop.fs.s3a.endpoint      s3.ap-northeast-2.amazonaws.com
+
+volumes:
+  kafka1-data:
+  kafka2-data:
+  kafka3-data:
+  spark-ivy:
+  spark-checkpoints:
+  airflow-db:

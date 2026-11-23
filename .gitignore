@@ -1,0 +1,9 @@
+# 비밀 값과 내 PC·EC2 전용 파일은 올리지 않는다
+.env
+*.pem
+*.key
+
+__pycache__/
+*.pyc
+.venv/
+*.log
