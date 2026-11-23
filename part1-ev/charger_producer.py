@@ -9,7 +9,7 @@ Kafka 토픽 ev-charging-sessions 에 보낸다. EC2 호스트에서 실행한�
 유실·중복 방지 설정
   - acks=all                : 리더와 ISR 복제본이 모두 받아야 성공으로 본다 (브로커 1대가 죽어도 유실 없음)
   - enable_idempotence=True : 재시도로 같은 배치가 두 번 가도 브로커가 한 번만 저장한다 (중복 없음)
-  - retries / max_in_flight_requests_per_connection<=5 : 멱등 Producer 의 전제 조건
+  - retries>0, max_in_flight_requests_per_connection=1 : kafka-python 멱등 Producer 의 전제 조건(순서도 보장)
 파티션 키
   - key = stationName       : 같은 충전기의 세션은 항상 같은 파티션으로 간다 (순서 보장)
 
@@ -81,7 +81,7 @@ def main():
         acks="all",
         enable_idempotence=True,
         retries=10,
-        max_in_flight_requests_per_connection=5,
+        max_in_flight_requests_per_connection=1,
         delivery_timeout_ms=120000,
         linger_ms=5,
         key_serializer=lambda k: k.encode("utf-8"),
